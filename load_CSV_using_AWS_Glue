@@ -1,0 +1,115 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+import time
+import pyspark
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+from pyspark.sql.functions import col,array_contains,row_number
+from pyspark.sql import functions as f
+from uuid import uuid4
+from pyspark.sql.window import Window
+
+## INITIALIZE Glue
+glueContext = GlueContext(SparkContext.getOrCreate())
+glueJob = Job(glueContext)
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+
+glueJob.init(args['JOB_NAME'] , args )
+
+#spark_session = SparkSession.builder.appName('pumpjackdataworks.com').getOrCreate()
+
+## INITIALIZE Spark Session
+sparkSession = glueContext.sparkSession
+
+
+##ETL read $RAW DATA from S3 file flat_data.csv$
+source_schema = StructType() \
+      .add("first_name",StringType(),True) \
+      .add("last_name",StringType(),True) \
+      .add("salary",IntegerType(),True) \
+      .add("dept_name",StringType(),True) \
+      .add("salary_increment",IntegerType(),True)
+
+df_with_source_schema = sparkSession.read.format("csv") \
+      .option("header", True) \
+      .schema(source_schema) \
+      .load("s3://pumpjackdataworks/flat_data.csv")
+      
+#df_with_source_schema.printSchema()
+#df_with_source_schema.show()
+
+##SELECT DEPARTMENT DISTINCAT and filling TABLE
+dept_schema = StructType() \
+      .add("UUID",IntegerType(),True) \
+      .add("dept_name",StringType(),True) \
+      .add("salary_increment",IntegerType(),True) 
+
+#sqlDF_dept_dist = sparkSession.createDataFrame(sparkSession.emptyRDD(), dept_schema)
+## create department table 
+df_with_source_schema.createOrReplaceTempView("department")
+sqlDF_dept_dist = sparkSession.sql("select distinct dept_name, salary_increment from department")
+
+## Temp table to add UUID
+sqlDF_dept_dist = sqlDF_dept_dist.alias("_tmp")
+sqlDF_dept_dist.registerTempTable("_tmp")
+
+df2 = sparkSession.sql("select uuid() as UUID , * from _tmp")
+
+## test results
+#df2.show()
+#sqlDF_dept_dist.show()
+
+#sqlDF_dept_dist.write.option("header","true").csv("s3://pumpjackdataworks/departments.csv")
+## write a single file of $department$ into S3 departments.csv
+df2.repartition(1).write.mode("overwrite").option("header", "true").csv("s3://pumpjackdataworks/departments")
+
+
+## EMPLOYEE DISTINCAT TABLE
+source_schema_emp = StructType() \
+      .add("UUID",IntegerType(),True) \
+      .add("first_name",StringType(),True) \
+      .add("last_name",StringType(),True) \
+      .add("salary",IntegerType(),True) \
+      .add("dept_name",StringType(),True) \
+      .add("salary_increment",IntegerType(),True)
+
+df_with_source_schema.createOrReplaceTempView("employee")
+sqlDF_emp_dist = sparkSession.sql("select distinct first_name, last_name, salary, dept_name, salary_increment from employee")
+#sqlDF_emp_dist.show()
+
+sqlDF_emp_dist = sqlDF_emp_dist.alias("_tmp1")
+sqlDF_emp_dist.registerTempTable("_tmp1")
+
+df3 = sparkSession.sql("select uuid() as UUID , * from _tmp1")
+## Test Employee Data after adding UUID
+#df3.show()
+
+## write a single file of $department$ into S3 employee
+df3.repartition(1).write.mode("overwrite").option("header", "true").csv("s3://pumpjackdataworks/employee")
+
+#### Updated Salaries
+df3 = df3.alias("updated_salaries")
+df3.registerTempTable("updated_salaries")
+
+#df_with_source_schema.createOrReplaceTempView("updated_salaries")
+sqlDF_US = sparkSession.sql("select distinct UUID as employee_id, salary*(1+salary_increment/100) as updated_salary from updated_salaries")
+## Test Updated Salaries
+#sqlDF_US.show()
+
+## write a single file of $department$ into S3 updatedsalaries.csv
+sqlDF_US.repartition(1).write.mode("overwrite").option("header", "true").csv("s3://pumpjackdataworks/updatedsalaries")
+
+#df_with_source_schema.write.format('jdbc').options(
+#          url='jdbc:mysql://database-2.cakb1ijxchmw.us-west-2.rds.amazonaws.com:3306/test',
+#          driver='com.mysql.jdbc.Driver',
+#          dbtable='departments',
+#          user='admin',
+#          password='adminadmin').mode('append').save()
+
+glueJob.commit()
+
+
